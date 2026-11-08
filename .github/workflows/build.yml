@@ -10,7 +10,8 @@
              python-version: "3.12"
          - run: pip install pyserial pyinstaller
          - run: pyinstaller --onefile --windowed obd_diag.py
+         - run: pyinstaller --onefile --windowed e60_diag.py
          - uses: actions/upload-artifact@v4
            with:
              name: obd_diag
-             path: dist/obd_diag.exe
+             path: dist/*.exe
