@@ -11,6 +11,7 @@
          - run: pip install pyserial pyinstaller
          - run: pyinstaller --onefile --windowed obd_diag.py
          - run: pyinstaller --onefile --windowed e60_diag.py
+         - run: pyinstaller --onefile --windowed bmw_e60_tool.py
          - uses: actions/upload-artifact@v4
            with:
              name: obd_diag
