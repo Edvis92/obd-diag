@@ -512,34 +512,57 @@ class App(tk.Tk):
         ttk.Button(acts, text="Identify", command=lambda: self.run(self.ident)).pack(side="left")
         ttk.Button(acts, text="Read faults", style="Accent.TButton", command=lambda: self.run(self.faults)).pack(side="left", padx=8)
         ttk.Button(acts, text="Stop", command=self.stop_scan).pack(side="left")
-        ttk.Button(acts, text="Copy log", command=self.copy).pack(side="right")
+        ttk.Button(acts, text="Copy this tab", command=self.copy).pack(side="right")
         ttk.Button(acts, text="Look up online", command=self.lookup).pack(side="right", padx=8)
 
-        box = ttk.Frame(self, padding=(14, 4, 14, 8))
-        box.pack(fill="both", expand=True)
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill="both", expand=True, padx=14, pady=(4, 8))
+        res_frame = ttk.Frame(self.tabs)
+        log_frame = ttk.Frame(self.tabs)
+        self.tabs.add(res_frame, text="  Results  ")
+        self.tabs.add(log_frame, text="  Technical log  ")
+
+        self.res = tk.Text(
+            res_frame, font=("Segoe UI", 11), state="disabled", bg="#181a20", fg=FG, relief="flat",
+            padx=20, pady=14, wrap="word", cursor="arrow", spacing1=2, spacing3=2,
+        )
+        rsb = ttk.Scrollbar(res_frame, command=self.res.yview)
+        self.res.config(yscrollcommand=rsb.set)
+        rsb.pack(side="right", fill="y")
+        self.res.pack(side="left", fill="both", expand=True)
+        r = self.res
+        r.tag_config("h1", font=("Segoe UI", 17, "bold"), foreground="#ffffff", spacing1=2, spacing3=2)
+        r.tag_config("sub", font=("Segoe UI", 10), foreground=MUTED, spacing3=8)
+        r.tag_config("chip", font=("Consolas", 12, "bold"), foreground="#14151a", background="#ffb454", spacing1=16)
+        r.tag_config("meaning", font=("Segoe UI", 12, "bold"), foreground="#ffffff", spacing1=16)
+        r.tag_config("orig", font=("Segoe UI", 10), foreground=MUTED, lmargin1=18, lmargin2=18, spacing3=2)
+        r.tag_config("item", font=("Segoe UI", 11), foreground=FG, lmargin1=18, lmargin2=34, spacing3=2)
+        r.tag_config("ok", font=("Segoe UI", 13, "bold"), foreground="#4cd964", spacing1=10)
+        r.tag_config("bad", font=("Segoe UI", 11, "bold"), foreground="#ff6b6b", spacing1=6)
+        r.tag_config("good", font=("Segoe UI", 12, "bold"), foreground="#4cd964")
+        r.tag_config("body", font=("Segoe UI", 11), foreground=FG, spacing3=4)
+        r.tag_config("hint", font=("Segoe UI", 10), foreground=MUTED, spacing1=14)
+
         self.text = tk.Text(
-            box, font=("Consolas", 10), state="disabled", bg="#0f1014", fg=FG,
+            log_frame, font=("Consolas", 9), state="disabled", bg="#0f1014", fg=FG,
             relief="flat", padx=10, pady=8, wrap="word", insertbackground=FG,
         )
-        sb = ttk.Scrollbar(box, command=self.text.yview)
+        sb = ttk.Scrollbar(log_frame, command=self.text.yview)
         self.text.config(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.text.pack(side="left", fill="both", expand=True)
         self.text.tag_config("tx", foreground="#7f8598")
         self.text.tag_config("rx", foreground="#8fd19e")
-        self.text.tag_config("head", foreground="#6aa9ff", font=("Consolas", 10, "bold"))
-        self.text.tag_config("good", foreground="#4cd964", font=("Consolas", 10, "bold"))
+        self.text.tag_config("head", foreground="#6aa9ff", font=("Consolas", 9, "bold"))
+        self.text.tag_config("good", foreground="#4cd964", font=("Consolas", 9, "bold"))
         self.text.tag_config("bad", foreground="#ff6b6b")
-        self.text.tag_config("fault", foreground="#ffb454", font=("Consolas", 10, "bold"))
-        self.text.tag_config("desc", foreground="#ffffff", font=("Consolas", 11, "bold"))
+        self.text.tag_config("fault", foreground="#ffb454", font=("Consolas", 9, "bold"))
 
         self.refresh()
-        self.log(f"Log is also saved to {self.logfile}")
+        self.render_welcome()
+        self.log(f"Technical log, also saved to {self.logfile}")
         if not self.db.con:
             self.log("ERROR: fault database e60_data.db not found - only fault numbers will be shown.")
-        self.log("Steps: plug cable into car, ignition ON, pick port, Open port, Quick scan.")
-        self.log("Then pick a module and your engine/car variant, and press Read faults.")
-        self.log("No car handy? Pick 'Demo (no car)' as the port to try the program with fake data.")
         self.after(100, self.drain)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -558,6 +581,9 @@ class App(tk.Tk):
         st.configure("TCombobox", fieldbackground=FIELD, background="#2f323d", foreground=FG, arrowcolor=FG, padding=5)
         st.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)])
         st.configure("Vertical.TScrollbar", background="#2f323d", troughcolor=PANEL, arrowcolor=FG)
+        st.configure("TNotebook", background=PANEL, borderwidth=0)
+        st.configure("TNotebook.Tab", background="#2f323d", foreground=MUTED, padding=(16, 8), borderwidth=0)
+        st.map("TNotebook.Tab", background=[("selected", ACCENT)], foreground=[("selected", "white")])
         self.option_add("*TCombobox*Listbox.background", FIELD)
         self.option_add("*TCombobox*Listbox.foreground", FG)
 
@@ -603,6 +629,13 @@ class App(tk.Tk):
                     self.status.set(item[1])
                 elif item[0] == "variant":
                     self.set_variant(item[1])
+                elif item[0] == "show":
+                    try:
+                        self.render(item[1], item[2])
+                    except Exception as e:
+                        self.text.config(state="normal")
+                        self.text.insert("end", f"ERROR drawing results: {e}\n")
+                        self.text.config(state="disabled")
             else:
                 lines.append(item)
         if lines:
@@ -620,8 +653,9 @@ class App(tk.Tk):
         self.after(100, self.drain)
 
     def copy(self):
+        box = self.res if self.tabs.index(self.tabs.select()) == 0 else self.text
         self.clipboard_clear()
-        self.clipboard_append(self.text.get("1.0", "end"))
+        self.clipboard_append(box.get("1.0", "end"))
 
     # ---- port / selection ----
     def refresh(self):
@@ -704,6 +738,9 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     # ---- actions ----
+    def show(self, kind, payload):
+        self.q.put(("show", kind, payload))
+
     def scan_quick(self, ctx):
         self.scan(QUICK)
 
@@ -711,26 +748,37 @@ class App(tk.Tk):
         self.scan([a for a, _ in self.db.addresses()] or QUICK)
 
     def scan(self, addrs):
-        self.log(f"--- Scan: asking {len(addrs)} modules to answer ---")
+        total = len(addrs)
+        self.log(f"--- Scan: asking {total} modules to answer ---")
         found = []
-        for a in addrs:
+        self.show("scan", dict(found=[], done=False, total=total, tried=0))
+        for i, a in enumerate(addrs, 1):
             if self.cancel:
                 self.log("Scan stopped.")
-                break
-            self.q.put(("status", f"Scanning {a:02X} {self.addr_name(a)} …"))
+                return self.show("scan", dict(found=list(found), done=True, stopped=True, total=total, tried=i - 1))
+            self.q.put(("status", f"Scanning {a:02X} {self.addr_name(a)} ({i} of {total}) …"))
             if self.k.start(a):
+                found.append((a, self.addr_name(a)))
                 self.log(f">>> {a:02X}  {self.addr_name(a)}  ANSWERED")
-                found.append(a)
                 self.k.stop(a)
+                self.show("scan", dict(found=list(found), done=False, total=total, tried=i))
             time.sleep(0.3)
-        names = ", ".join(f"{a:02X}" for a in found) or "none"
-        self.log(f"--- Scan done. Modules that answered: {names} ---")
+        self.log("--- Scan done ---")
+        self.show("scan", dict(found=found, done=True, total=total, tried=total))
+
+    def no_answer(self, name):
+        self.log("No answer from module (see TX/RX lines above)")
+        self.show("message", dict(
+            title=name, level="bad",
+            text="This module did not answer.\nCheck that the cable is plugged in at both ends, the ignition is on, "
+                 "and that your car has this module. The Technical log tab shows what was sent.",
+        ))
 
     def ident(self, ctx):
-        t, sgbd, _ = ctx
+        t, sgbd, name = ctx
         self.log(f"--- Identify module {t:02X} ---")
         if not self.k.start(t):
-            return self.log("No answer from module (see TX/RX lines above)")
+            return self.no_answer(name)
         r = self.k.request(t, [0x1A, 0x80])
         if r and r[0] == 0x5A:
             text = ascii_part(r[2:])
@@ -738,67 +786,67 @@ class App(tk.Tk):
             hexs = "".join(f"{x:02X}" for x in r[2:])
             nums = set(re.findall(r"\d{7}", text)) | set(re.findall(r"(?=(\d{7}))", hexs))
             match = self.db.by_hwnr(t, nums)
-            if len(match) == 1:
-                sg = next(iter(match))
+            sg = next(iter(match)) if len(match) == 1 else None
+            if sg:
                 self.log(f"Part number matches variant {sg} - selected it for you.")
                 self.q.put(("variant", sg))
+            self.show("ident", dict(module=name, text=text, match=sg))
         else:
-            self.explain(r)
+            self.show("message", dict(title=name, level="bad", text=self.explain(r)))
         self.k.stop(t)
 
     def faults(self, ctx):
         t, sgbd, name = ctx
         self.log(f"--- Fault memory of module {name} ---")
         if not self.k.start(t):
-            return self.log("No answer from module (see TX/RX lines above)")
+            return self.no_answer(name)
         r = self.k.request(t, [0x18, 0x00, 0xFF, 0x00])
         if r and r[0] == 0x58:
             body = r[2:]
-            found = []
+            items = []
             for i in range(0, len(body) - 2, 3):
                 hi, lo, st = body[i], body[i + 1], body[i + 2]
-                raw = f"{hi:02X}{lo:02X}"
-                found.append((raw, st, self.explain_code(t, sgbd, raw)))
-            self.last_faults = [(name, raw) for raw, st, _ in found]
-            if not found:
-                self.log("No stored faults reported.")
-            self.save_report(name, sgbd, found)
+                items.append(self.explain_code(t, sgbd, f"{hi:02X}{lo:02X}", st))
+            self.last_faults = [(name, it["code"]) for it in items]
+            path = self.save_report(name, sgbd, items)
+            self.show("faults", dict(module=name, sgbd=sgbd, items=items, path=path))
         else:
-            self.explain(r)
+            self.show("message", dict(title=name, level="bad", text=self.explain(r)))
         self.k.stop(t)
 
-    def explain_code(self, addr, sgbd, raw):
-        """Logs the meaning of one fault code; returns a one-line text for the report."""
-        self.log(f"FAULT {raw}")
+    def explain_code(self, addr, sgbd, raw, st):
+        """Looks up one fault code; returns a dict used by the result cards and the report."""
+        self.log(f"FAULT {raw}  status {st:02X}")
+        item = {"code": raw, "st": st, "groups": [], "note": "", "more": 0}
         if not self.db.con:
-            self.log("      (no fault database loaded)")
-            return "(no database)"
+            item["note"] = "No fault database loaded."
+            return item
         if sgbd:
             row = self.db.one(sgbd, raw)
             if not row:
-                self.log(f"      (code {raw} is not in the database for {sgbd} - wrong variant?)")
-                return "(not in database for this variant)"
+                item["note"] = "Not in the database for this variant. Is the variant right?"
+                return item
             en, rough, de = describe(row[0], row[1], raw)
-            self.log(f"      EN: {en}" + ("   (rough translation)" if rough else ""))
-            if rough and de:
-                self.log(f"      DE: {de}")
-            return en + (f"  [DE: {de}]" if de else "")
+            item["groups"].append({"en": en, "rough": rough, "de": de, "variants": ""})
+            return item
         groups = self.db.many(addr, raw)
         if not groups:
-            self.log("      (code not found in any variant for this module)")
-            return "(not in database)"
-        summary = []
+            item["note"] = "Not found in any variant of this module."
+            return item
         for de, en, sgs in groups[:4]:
             en_t, rough, de_t = describe(de, en, raw)
             who = ", ".join(sgs[:3]) + (f" +{len(sgs) - 3} more" if len(sgs) > 3 else "")
-            self.log(f"      EN: {en_t}" + ("   (rough translation)" if rough else ""))
-            self.log(f"      DE: {de_t}   [{who}]" if de_t else f"      [{who}]")
-            summary.append(en_t)
-        if len(groups) > 1:
-            self.log("      The meaning depends on the variant - pick yours in the Variant list.")
-        return " / ".join(summary[:2])
+            item["groups"].append({"en": en_t, "rough": rough, "de": de_t, "variants": who})
+        item["more"] = max(0, len(groups) - 4)
+        return item
 
-    def save_report(self, module, sgbd, found):
+    @staticmethod
+    def item_text(it):
+        if not it["groups"]:
+            return it["note"]
+        return " / ".join(g["en"] + (f"  [DE: {g['de']}]" if g["de"] else "") for g in it["groups"][:2])
+
+    def save_report(self, module, sgbd, items):
         folder = os.path.join(os.path.expanduser("~"), "Documents")
         if not os.path.isdir(folder):
             folder = os.path.expanduser("~")
@@ -806,13 +854,110 @@ class App(tk.Tk):
         try:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M')}  {module}  variant: {sgbd or 'auto'} ===\n")
-                if not found:
+                if not items:
                     f.write("No stored faults\n")
-                for raw, st, text in found:
-                    f.write(f"{raw}  status {st:02X}  {text}\n")
-            self.log(f"Fault report saved to {path}")
+                for it in items:
+                    f.write(f"{it['code']}  {self.item_text(it)}\n")
+            return path
         except Exception as e:
             self.log(f"ERROR: could not save report: {e}")
+            return None
+
+    # ---- result cards ----
+    def res_clear(self):
+        self.res.config(state="normal")
+        self.res.delete("1.0", "end")
+        self.res.config(state="disabled")
+
+    def res_add(self, text, *tags):
+        self.res.config(state="normal")
+        self.res.insert("end", text, tags)
+        self.res.config(state="disabled")
+
+    def render(self, kind, payload):
+        getattr(self, "render_" + kind)(payload)
+        self.tabs.select(0)
+
+    def render_welcome(self):
+        self.res_clear()
+        self.res_add("Welcome\n", "h1")
+        self.res_add("Read the fault memory of your BMW E60 and see what each fault means.\n", "sub")
+        for i, s in enumerate([
+            "Plug the cable into the car and the PC, and turn the ignition on.",
+            "Choose the port above and press Open port.",
+            "Press Quick scan to see which modules answer.",
+            "Pick a module and your variant, then press Read faults.",
+        ], 1):
+            self.res_add(f"{i}.  {s}\n", "item")
+        self.res_add("\nNo car handy? Choose 'Demo (no car)' as the port to try the program.\n", "hint")
+        if not self.db.con:
+            self.res_add("\nThe fault database (e60_data.db) was not found, so only fault numbers can be shown.\n", "bad")
+
+    def render_message(self, p):
+        self.res_clear()
+        self.res_add(p["title"] + "\n", "h1")
+        self.res_add(p["text"] + "\n", "bad" if p.get("level") == "bad" else "body")
+
+    def render_scan(self, p):
+        self.res_clear()
+        self.res_add("Modules\n", "h1")
+        if p["done"]:
+            state = "Scan stopped" if p.get("stopped") else "Scan complete"
+        else:
+            state = f"Scanning…  {p['tried']} of {p['total']}"
+        self.res_add(f"{state}   ·   {len(p['found'])} answered\n", "sub")
+        for a, name in p["found"]:
+            self.res_add("●  ", "good")
+            self.res_add(f"{a:02X}    {name}\n", "body")
+        if p["done"] and p["found"]:
+            self.res_add("\nChoose a module in the Module list above and press Read faults.\n", "hint")
+        elif p["done"]:
+            self.res_add(
+                "\nNothing answered. Check that the cable is plugged in at both ends, the ignition is on, "
+                "the cable switch is on K-line and the right port is open.\n", "bad")
+
+    def render_ident(self, p):
+        self.res_clear()
+        self.res_add("Identification\n", "h1")
+        self.res_add(p["module"] + "\n", "sub")
+        self.res_add(p["text"] + "\n", "meaning")
+        if p.get("match"):
+            self.res_add(f"\nThe part number matches variant {p['match']}. It has been selected for you.\n", "good")
+        else:
+            self.res_add("\nThis text helps to tell which variant your control unit is.\n", "hint")
+
+    def render_faults(self, p):
+        self.res_clear()
+        items = p["items"]
+        n = len(items)
+        self.res_add(p["module"] + "\n", "h1")
+        variant = f"Variant: {p['sgbd']}" if p["sgbd"] else "Variant: not chosen, showing every possibility"
+        self.res_add(f"{variant}   ·   {n} fault{'s' if n != 1 else ''} stored\n", "sub")
+        if not n:
+            self.res_add("✓  No stored faults\n", "ok")
+        for it in items:
+            self.res_add(f" {it['code']} ", "chip")
+            groups = it["groups"]
+            if not groups:
+                self.res_add("   " + it["note"] + "\n", "meaning")
+            elif len(groups) == 1:
+                g = groups[0]
+                self.res_add("   " + g["en"] + "\n", "meaning")
+                if g["de"]:
+                    self.res_add(f"German original: {g['de']}   ·   translated automatically\n", "orig")
+                if g["variants"]:
+                    self.res_add(f"Variants: {g['variants']}\n", "orig")
+            else:
+                self.res_add("   Meaning depends on the variant\n", "meaning")
+                for g in groups:
+                    mark = "  (translated automatically)" if g["rough"] else ""
+                    self.res_add(f"•  {g['en']}{mark}   [{g['variants']}]\n", "item")
+                if it["more"]:
+                    self.res_add(f"…and {it['more']} more possibilities\n", "orig")
+        if p.get("path"):
+            self.res_add(f"\nSaved to {p['path']}\n", "hint")
+        if any(len(it["groups"]) > 1 for it in items):
+            self.res_add("Pick your variant in the Variant list and press Read faults again for one clear answer.\n", "hint")
 
     def lookup(self):
         if not self.last_faults:
@@ -824,11 +969,13 @@ class App(tk.Tk):
 
     def explain(self, r):
         if r is None:
-            self.log("No reply.")
+            msg = "The module did not reply to the request."
         elif r[0] == 0x7F and len(r) >= 3:
-            self.log(f"Module refused: {NRC.get(r[2], hex(r[2]))}")
+            msg = f"The module refused the request: {NRC.get(r[2], hex(r[2]))}."
         else:
-            self.log("Unexpected reply: " + hx(r))
+            msg = "Unexpected reply: " + hx(r)
+        self.log(msg)
+        return msg
 
     def on_close(self):
         if self.k:
