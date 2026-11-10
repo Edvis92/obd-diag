@@ -7,6 +7,7 @@ It never codes, clears, flashes or writes anything to the car.
 Setup:   pip install pyserial
 Run:     python e60_full.py     (needs e60_data.db in the same folder)
 """
+import json
 import os
 import queue
 import re
@@ -43,6 +44,22 @@ NRC = {
     0x10: "general reject", 0x11: "service not supported", 0x12: "sub-function not supported",
     0x22: "conditions not correct", 0x31: "request out of range", 0x33: "security access denied",
     0x78: "response pending",
+}
+
+# Standard OBD-II live values: pid -> (label, unit, decoder, decimals)
+LIVE = {
+    0x0C: ("Engine speed", "rpm", lambda d: (d[0] * 256 + d[1]) / 4, 0),
+    0x0D: ("Vehicle speed", "km/h", lambda d: d[0], 0),
+    0x05: ("Coolant temperature", "°C", lambda d: d[0] - 40, 0),
+    0x0F: ("Intake air temperature", "°C", lambda d: d[0] - 40, 0),
+    0x04: ("Engine load", "%", lambda d: d[0] * 100 / 255, 0),
+    0x11: ("Throttle position", "%", lambda d: d[0] * 100 / 255, 0),
+    0x10: ("Air flow (MAF)", "g/s", lambda d: (d[0] * 256 + d[1]) / 100, 1),
+    0x0B: ("Intake pressure", "kPa", lambda d: d[0], 0),
+    0x06: ("Short-term fuel trim", "%", lambda d: (d[0] - 128) * 100 / 128, 1),
+    0x07: ("Long-term fuel trim", "%", lambda d: (d[0] - 128) * 100 / 128, 1),
+    0x0E: ("Ignition timing", "°", lambda d: d[0] / 2 - 64, 1),
+    0x42: ("Battery voltage", "V", lambda d: (d[0] * 256 + d[1]) / 1000, 2),
 }
 
 # ---------------------------------------------------------------------------
@@ -300,6 +317,28 @@ class FakeSerial:
         msg.append(sum(msg) & 0xFF)
         self.buf += bytes(msg)
 
+    LIVE_PIDS = [0x04, 0x05, 0x06, 0x07, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x42]
+
+    @classmethod
+    def mask(cls, base):
+        pids = set(cls.LIVE_PIDS) | {0x20, 0x40}
+        m = sum(1 << (31 - (p - base - 1)) for p in pids if base < p <= base + 32)
+        return list(m.to_bytes(4, "big"))
+
+    @classmethod
+    def live_value(cls, pid):
+        import math
+        t = time.time()
+        if pid in (0x00, 0x20, 0x40):
+            return cls.mask(pid)
+        rpm = int((820 + 120 * math.sin(t * 1.3) + 40 * math.sin(t * 5)) * 4)
+        volts = int(13900 + 120 * math.sin(t))
+        return {
+            0x04: [int((22 + 3 * math.sin(t)) * 2.55)], 0x05: [88 + 40], 0x06: [130], 0x07: [125],
+            0x0B: [35], 0x0C: [rpm >> 8, rpm & 255], 0x0D: [0], 0x0E: [148], 0x0F: [24 + 40],
+            0x10: [1, 0x40], 0x11: [int(14 * 2.55)], 0x42: [volts >> 8, volts & 255],
+        }.get(pid, [0])
+
     def write(self, msg):
         time.sleep(0.02)
         self.buf += msg  # echo, like a real K-line cable
@@ -313,6 +352,8 @@ class FakeSerial:
             self.reply(module, [0xC2])
         elif data[:2] == [0x1A, 0x80]:
             self.reply(module, [0x5A, 0x80] + list(self.PRESENT[module]))
+        elif data[0] == 0x01 and len(data) > 1 and module == 0x12:
+            self.reply(module, [0x41, data[1]] + self.live_value(data[1]))
         elif data[0] == 0x18:
             faults = self.FAULTS.get(module, [])
             body = [x for f in faults for x in f]
@@ -337,9 +378,10 @@ class KLine:
             pass
 
     @staticmethod
-    def frame(target, data):
+    def frame(target, data, functional=False):
         n = len(data)
-        hdr = [0x80 | n, target, TESTER] if n <= 63 else [0x80, target, TESTER, n]
+        base = 0xC0 if functional else 0x80
+        hdr = [base | n, target, TESTER] if n <= 63 else [base, target, TESTER, n]
         msg = hdr + list(data)
         msg.append(sum(msg) & 0xFF)
         return bytes(msg)
@@ -389,8 +431,8 @@ class KLine:
             self.log("   (checksum mismatch)")
         return data
 
-    def request(self, target, data, timeout=1.5):
-        self.send(self.frame(target, data))
+    def request(self, target, data, timeout=1.5, functional=False):
+        self.send(self.frame(target, data, functional))
         for _ in range(20):
             r = self.recv(timeout)
             if r is None:
@@ -401,19 +443,19 @@ class KLine:
             return r
         return None
 
-    def start(self, target):
+    def start(self, target, functional=False):
         """Fast init (25 ms low / 25 ms high), then StartCommunication."""
         self.ser.reset_input_buffer()
         self.ser.break_condition = True
         wait(0.025)
         self.ser.break_condition = False
         wait(0.025)
-        r = self.request(target, [0x81], timeout=1.0)
+        r = self.request(target, [0x81], timeout=1.0, functional=functional)
         return bool(r) and r[0] == 0xC1
 
-    def stop(self, target):
+    def stop(self, target, functional=False):
         try:
-            self.request(target, [0x82], timeout=0.5)
+            self.request(target, [0x82], timeout=0.5, functional=functional)
         except Exception:
             pass
 
@@ -455,8 +497,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("BMW E60 diagnostics (read-only)")
-        self.geometry("780x740")
-        self.minsize(680, 560)
+        self.geometry("960x780")
+        self.minsize(900, 580)
         self.k = None
         self.busy = False
         self.cancel = False
@@ -464,6 +506,8 @@ class App(tk.Tk):
         self.q = queue.Queue()
         self.db = FaultDB()
         self.logfile = os.path.join(os.path.expanduser("~"), "e60_log.txt")
+        self.settings_path = os.path.join(os.path.expanduser("~"), "e60_settings.json")
+        self.settings = self.read_settings()
         self.style_ui()
 
         head = tk.Frame(self, bg=BG)
@@ -497,12 +541,15 @@ class App(tk.Tk):
         self.var = ttk.Combobox(sel, width=58, state="readonly")
         self.var.grid(row=1, column=1, padx=(14, 0), sticky="we")
         sel.columnconfigure(1, weight=1)
-        self.mod.bind("<<ComboboxSelected>>", lambda e: self.fill_variants())
+        self.mod.bind("<<ComboboxSelected>>", lambda e: self.on_module())
+        self.var.bind("<<ComboboxSelected>>", lambda e: self.remember())
+        self.port.bind("<<ComboboxSelected>>", lambda e: self.remember())
         addrs = self.db.addresses()
         if not addrs:
             addrs = [(a, ADDR_NAMES.get(a, "Module")) for a in QUICK]
         self.mod["values"] = [f"{a:02X}  {ADDR_NAMES.get(a, n or 'Module')[:40]}" for a, n in addrs]
-        self.mod.set("12  " + ADDR_NAMES[0x12])
+        saved_mod = self.settings.get("module")
+        self.mod.set(saved_mod if saved_mod in self.mod["values"] else "12  " + ADDR_NAMES[0x12])
         self.fill_variants()
 
         acts = ttk.Frame(self, padding=(14, 10))
@@ -511,7 +558,8 @@ class App(tk.Tk):
         ttk.Button(acts, text="Full scan", command=lambda: self.run(self.scan_full, scan=True)).pack(side="left", padx=8)
         ttk.Button(acts, text="Identify", command=lambda: self.run(self.ident)).pack(side="left")
         ttk.Button(acts, text="Read faults", style="Accent.TButton", command=lambda: self.run(self.faults)).pack(side="left", padx=8)
-        ttk.Button(acts, text="Stop", command=self.stop_scan).pack(side="left")
+        ttk.Button(acts, text="Live data", style="Accent.TButton", command=lambda: self.run(self.live, scan=True)).pack(side="left")
+        ttk.Button(acts, text="Stop", command=self.stop_scan).pack(side="left", padx=8)
         ttk.Button(acts, text="Copy this tab", command=self.copy).pack(side="right")
         ttk.Button(acts, text="Look up online", command=self.lookup).pack(side="right", padx=8)
 
@@ -519,8 +567,28 @@ class App(tk.Tk):
         self.tabs.pack(fill="both", expand=True, padx=14, pady=(4, 8))
         res_frame = ttk.Frame(self.tabs)
         log_frame = ttk.Frame(self.tabs)
+        live_frame = ttk.Frame(self.tabs, padding=14)
         self.tabs.add(res_frame, text="  Results  ")
+        self.tabs.add(live_frame, text="  Live data  ")
         self.tabs.add(log_frame, text="  Technical log  ")
+        self.live_info = tk.Label(
+            live_frame, text="Press Live data to read the engine computer. Press Stop to end.",
+            anchor="w", bg=PANEL, fg=MUTED, font=("Segoe UI", 10),
+        )
+        self.live_info.pack(fill="x")
+        self.live_grid = tk.Frame(live_frame, bg=PANEL)
+        self.live_grid.pack(fill="both", expand=True, pady=(8, 0))
+        for c in range(3):
+            self.live_grid.columnconfigure(c, weight=1, uniform="live")
+        self.live_vals = {}
+        for pid, (label, unit, _f, _d) in LIVE.items():
+            card = tk.Frame(self.live_grid, bg="#181a20", padx=16, pady=12)
+            tk.Label(card, text=label.upper(), font=("Segoe UI", 8, "bold"), fg=MUTED, bg="#181a20").pack(anchor="w")
+            v = tk.StringVar(value="—")
+            tk.Label(card, textvariable=v, font=("Segoe UI", 26, "bold"), fg="#ffffff", bg="#181a20").pack(anchor="w")
+            tk.Label(card, text=unit, font=("Segoe UI", 9), fg=MUTED, bg="#181a20").pack(anchor="w")
+            self.live_vals[pid] = (v, card)
+        self.live_init(list(LIVE), None)
 
         self.res = tk.Text(
             res_frame, font=("Segoe UI", 11), state="disabled", bg="#181a20", fg=FG, relief="flat",
@@ -629,6 +697,14 @@ class App(tk.Tk):
                     self.status.set(item[1])
                 elif item[0] == "variant":
                     self.set_variant(item[1])
+                    self.remember()
+                elif item[0] == "live":
+                    self.live_set(item[1], item[2])
+                elif item[0] == "live_init":
+                    self.live_init(item[1], item[2])
+                    self.tabs.select(1)
+                elif item[0] == "live_state":
+                    self.live_info.config(text=item[1])
                 elif item[0] == "show":
                     try:
                         self.render(item[1], item[2])
@@ -653,16 +729,23 @@ class App(tk.Tk):
         self.after(100, self.drain)
 
     def copy(self):
-        box = self.res if self.tabs.index(self.tabs.select()) == 0 else self.text
+        i = self.tabs.index(self.tabs.select())
+        if i == 0:
+            txt = self.res.get("1.0", "end")
+        elif i == 1:
+            txt = "\n".join(f"{LIVE[p][0]}: {v.get()} {LIVE[p][1]}" for p, (v, _) in self.live_vals.items())
+        else:
+            txt = self.text.get("1.0", "end")
         self.clipboard_clear()
-        self.clipboard_append(box.get("1.0", "end"))
+        self.clipboard_append(txt)
 
     # ---- port / selection ----
     def refresh(self):
         ports = [p.device for p in list_ports.comports()] + [DEMO]
         self.port["values"] = ports
         if not self.port.get():
-            self.port.set(ports[0])
+            saved = self.settings.get("port")
+            self.port.set(saved if saved in ports else ports[0])
 
     def toggle(self):
         if self.k:
@@ -693,9 +776,53 @@ class App(tk.Tk):
         except ValueError:
             return
         vs = self.db.variants(addr)
-        values = [AUTO] + [f"{sg}  -  {name}" for sg, name in vs]
+        values = [AUTO] + [f"{sg}  -  {rough_english(name)}" for sg, name in vs]
         self.var["values"] = values
-        self.var.set(values[1] if len(vs) == 1 else AUTO)
+        saved = self.settings.get("variants", {}).get(f"{addr:02X}")
+        pick = next((v for v in values if saved and v.startswith(saved + "  -  ")), None)
+        self.var.set(pick or (values[1] if len(vs) == 1 else AUTO))
+
+    def on_module(self):
+        self.fill_variants()
+        self.remember()
+
+    def read_settings(self):
+        try:
+            with open(self.settings_path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def remember(self):
+        """Saves port, module and the variant chosen for each module."""
+        self.settings["port"] = self.port.get()
+        self.settings["module"] = self.mod.get()
+        try:
+            key = f"{self.target():02X}"
+            variants = self.settings.setdefault("variants", {})
+            sg = self.current_sgbd()
+            if sg:
+                variants[key] = sg
+            else:
+                variants.pop(key, None)
+        except ValueError:
+            pass
+        try:
+            with open(self.settings_path, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, indent=1)
+        except Exception:
+            pass
+
+    def guess_variant(self, addr, codes):
+        """Variants at this address that know every one of these fault codes."""
+        sets = []
+        for code in codes:
+            rows = self.db.q(
+                "select e.sgbd from dtc d join ecu e on e.sgbd=d.sgbd where e.addr=? and d.code=?", (addr, code))
+            if rows:
+                sets.append({r[0] for r in rows})
+        return set.intersection(*sets) if sets else set()
 
     def set_variant(self, sgbd):
         for v in self.var["values"]:
@@ -803,13 +930,21 @@ class App(tk.Tk):
         r = self.k.request(t, [0x18, 0x00, 0xFF, 0x00])
         if r and r[0] == 0x58:
             body = r[2:]
-            items = []
-            for i in range(0, len(body) - 2, 3):
-                hi, lo, st = body[i], body[i + 1], body[i + 2]
-                items.append(self.explain_code(t, sgbd, f"{hi:02X}{lo:02X}", st))
+            codes = [(f"{body[i]:02X}{body[i + 1]:02X}", body[i + 2]) for i in range(0, len(body) - 2, 3)]
+            detected, candidates = None, []
+            if not sgbd and codes:
+                common = self.guess_variant(t, [c for c, _ in codes])
+                if len(common) == 1:
+                    detected = sgbd = next(iter(common))
+                    self.log(f"Only variant {detected} knows all of these fault codes - selected it.")
+                    self.q.put(("variant", detected))
+                elif 1 < len(common) < len(self.db.variants(t)):
+                    candidates = sorted(common)
+            items = [self.explain_code(t, sgbd, raw, st) for raw, st in codes]
             self.last_faults = [(name, it["code"]) for it in items]
             path = self.save_report(name, sgbd, items)
-            self.show("faults", dict(module=name, sgbd=sgbd, items=items, path=path))
+            self.show("faults", dict(module=name, sgbd=sgbd, items=items, path=path,
+                                     detected=detected, candidates=candidates, ncodes=len(codes)))
         else:
             self.show("message", dict(title=name, level="bad", text=self.explain(r)))
         self.k.stop(t)
@@ -863,6 +998,95 @@ class App(tk.Tk):
             self.log(f"ERROR: could not save report: {e}")
             return None
 
+    # ---- live data ----
+    def live_init(self, pids, text):
+        for pid, (v, card) in self.live_vals.items():
+            card.grid_forget()
+            v.set("—")
+        for i, pid in enumerate(p for p in LIVE if p in pids):
+            self.live_vals[pid][1].grid(row=i // 3, column=i % 3, padx=6, pady=6, sticky="nsew")
+        if text:
+            self.live_info.config(text=text)
+
+    def live_set(self, pid, value):
+        v = self.live_vals[pid][0]
+        v.set("n/a" if value is None else f"{value:.{LIVE[pid][3]}f}")
+
+    def read_pid(self, t, pid, functional):
+        r = self.k.request(t, [0x01, pid], timeout=0.8, functional=functional)
+        if r and len(r) >= 2 and r[0] == 0x41 and r[1] == pid:
+            return list(r[2:])
+        return None
+
+    def discover_pids(self, t, functional):
+        """Asks which standard live values the engine computer offers."""
+        supported, base = set(), 0x00
+        while base <= 0x40:
+            d = self.read_pid(t, base, functional)
+            if not d or len(d) < 4:
+                break
+            for i in range(32):
+                if d[i // 8] & (0x80 >> (i % 8)):
+                    supported.add(base + i + 1)
+            if (base + 0x20) not in supported:
+                break
+            base += 0x20
+        return supported
+
+    def live_connect(self):
+        """Tries the engine computer directly, then the standard OBD-II address."""
+        k = self.k
+        if k.start(0x12) and self.read_pid(0x12, 0x00, False) is not None:
+            return 0x12, False
+        k.stop(0x12)
+        time.sleep(0.5)
+        if k.start(0x33, functional=True) and self.read_pid(0x33, 0x00, True) is not None:
+            return 0x33, True
+        k.stop(0x33, functional=True)
+        return None
+
+    def live(self, ctx):
+        self.log("--- Live data ---")
+        self.q.put(("status", "Connecting to the engine computer …"))
+        conn = self.live_connect()
+        if not conn:
+            return self.show("message", dict(
+                title="Live data", level="bad",
+                text="The engine computer did not answer the standard live-data requests.\n"
+                     "Check the cable and ignition, and that this car's engine computer supports standard "
+                     "OBD-II over the K-line. The Technical log tab shows what was sent.",
+            ))
+        t, functional = conn
+        supported = self.discover_pids(t, functional)
+        pids = [p for p in LIVE if p in supported] or list(LIVE)
+        how = "directly" if not functional else "through the standard OBD-II address"
+        self.q.put(("live_init", pids, f"Reading the engine computer {how}. About one update per second. Press Stop to end."))
+        self.q.put(("status", "Live data running …"))
+        orig = self.k.log
+        self.k.log = lambda s: None  # don't flood the technical log
+        bad_cycles = 0
+        try:
+            while not self.cancel and bad_cycles < 3:
+                got = 0
+                for p in pids:
+                    if self.cancel:
+                        break
+                    d = self.read_pid(t, p, functional)
+                    val = None
+                    if d:
+                        try:
+                            val = LIVE[p][2](d)
+                            got += 1
+                        except Exception:
+                            val = None
+                    self.q.put(("live", p, val))
+                bad_cycles = bad_cycles + 1 if got == 0 and not self.cancel else 0
+        finally:
+            self.k.log = orig
+            self.k.stop(t, functional)
+            self.q.put(("live_state", "Connection lost. Press Live data to try again." if bad_cycles >= 3
+                        else "Stopped. Press Live data to start again."))
+
     # ---- result cards ----
     def res_clear(self):
         self.res.config(state="normal")
@@ -887,6 +1111,7 @@ class App(tk.Tk):
             "Choose the port above and press Open port.",
             "Press Quick scan to see which modules answer.",
             "Pick a module and your variant, then press Read faults.",
+            "Press Live data to watch engine values such as speed, temperatures and battery voltage.",
         ], 1):
             self.res_add(f"{i}.  {s}\n", "item")
         self.res_add("\nNo car handy? Choose 'Demo (no car)' as the port to try the program.\n", "hint")
@@ -931,7 +1156,12 @@ class App(tk.Tk):
         items = p["items"]
         n = len(items)
         self.res_add(p["module"] + "\n", "h1")
-        variant = f"Variant: {p['sgbd']}" if p["sgbd"] else "Variant: not chosen, showing every possibility"
+        if p["sgbd"]:
+            variant = f"Variant: {p['sgbd']}"
+            if p.get("detected"):
+                variant += f" (detected from your {p['ncodes']} fault code{'s' if p['ncodes'] != 1 else ''})"
+        else:
+            variant = "Variant: not chosen, showing every possibility"
         self.res_add(f"{variant}   ·   {n} fault{'s' if n != 1 else ''} stored\n", "sub")
         if not n:
             self.res_add("✓  No stored faults\n", "ok")
@@ -956,7 +1186,10 @@ class App(tk.Tk):
                     self.res_add(f"…and {it['more']} more possibilities\n", "orig")
         if p.get("path"):
             self.res_add(f"\nSaved to {p['path']}\n", "hint")
-        if any(len(it["groups"]) > 1 for it in items):
+        if p.get("candidates"):
+            self.res_add("These variants know all of your codes: " + ", ".join(p["candidates"])
+                         + ". Pick yours in the Variant list for one clear answer.\n", "hint")
+        elif any(len(it["groups"]) > 1 for it in items):
             self.res_add("Pick your variant in the Variant list and press Read faults again for one clear answer.\n", "hint")
 
     def lookup(self):
@@ -978,6 +1211,7 @@ class App(tk.Tk):
         return msg
 
     def on_close(self):
+        self.remember()
         if self.k:
             self.k.close()
         self.destroy()
