@@ -9,10 +9,8 @@
            with:
              python-version: "3.12"
          - run: pip install pyserial pyinstaller
-         - run: pyinstaller --onefile --windowed obd_diag.py
-         - run: pyinstaller --onefile --windowed e60_diag.py
-         - run: pyinstaller --onefile --windowed bmw_e60_tool.py
+         - run: pyinstaller --onefile --windowed --add-data "e60_data.db;." e60_full.py
          - uses: actions/upload-artifact@v4
            with:
-             name: obd_diag
-             path: dist/*.exe
+             name: e60_full
+             path: dist/e60_full.exe
