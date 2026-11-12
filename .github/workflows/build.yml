@@ -9,7 +9,7 @@
            with:
              python-version: "3.12"
          - run: pip install pyserial pyinstaller
-         - run: pyinstaller --onefile --windowed --add-data "e60_data.db;." e60_full.py
+         - run: pyinstaller --onefile --windowed --icon e60_icon.ico --add-data "e60_data.db;." --add-data "e60_icon.ico;." e60_full.py
          - uses: actions/upload-artifact@v4
            with:
              name: e60_full
