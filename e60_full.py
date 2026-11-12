@@ -8,6 +8,7 @@ Setup:   pip install pyserial
 Run:     python e60_full.py     (needs e60_data.db in the same folder)
 """
 import json
+import math
 import os
 import queue
 import re
@@ -204,13 +205,17 @@ def app_dir():
     return os.path.dirname(base)
 
 
-def data_path():
+def resource(name):
     for base in (getattr(sys, "_MEIPASS", None), app_dir()):
         if base:
-            p = os.path.join(base, "e60_data.db")
+            p = os.path.join(base, name)
             if os.path.exists(p):
                 return p
     return None
+
+
+def data_path():
+    return resource("e60_data.db")
 
 
 def clean(text, raw):
@@ -366,6 +371,8 @@ class KLine:
     def __init__(self, port, log):
         self.log = log
         self.pending = bytearray()
+        self.last_ok = None
+        self.last_fail = None
         if port == DEMO:
             self.ser = FakeSerial()
         else:
@@ -432,6 +439,14 @@ class KLine:
         return data
 
     def request(self, target, data, timeout=1.5, functional=False):
+        r = self._request(target, data, timeout, functional)
+        if r is None:
+            self.last_fail = time.time()
+        else:
+            self.last_ok = time.time()
+        return r
+
+    def _request(self, target, data, timeout=1.5, functional=False):
         self.send(self.frame(target, data, functional))
         for _ in range(20):
             r = self.recv(timeout)
@@ -464,12 +479,31 @@ def ascii_part(b):
     return "".join(chr(x) if 32 <= x < 127 else "." for x in b)
 
 
-BG = "#14151a"
-PANEL = "#1d1f26"
-FIELD = "#2a2d37"
-FG = "#e6e8ee"
-MUTED = "#8b90a0"
-ACCENT = "#1c69d4"
+PALETTES = {
+    "dark": dict(
+        BG="#14151a", PANEL="#1d1f26", FIELD="#2a2d37", FG="#e6e8ee", MUTED="#8b90a0", ACCENT="#1c69d4",
+        CARD="#181a20", LOGBG="#0f1014", BTN="#2f323d", BTN_HOVER="#3b3f4d", STRONG="#ffffff",
+        GOOD="#4cd964", BAD="#ff6b6b", WARN="#ffb454", HEADBLUE="#6aa9ff", BODY="#4b5263",
+        GLASS="#9fb4d0", WHEEL="#262830", TRACK="#2c2f3a",
+    ),
+    "light": dict(
+        BG="#ffffff", PANEL="#f1f3f8", FIELD="#ffffff", FG="#1c1f26", MUTED="#6b7280", ACCENT="#1c69d4",
+        CARD="#ffffff", LOGBG="#fbfbfd", BTN="#e3e7ee", BTN_HOVER="#d3d9e4", STRONG="#101218",
+        GOOD="#1a9b3c", BAD="#d13b3b", WARN="#e8912d", HEADBLUE="#1c69d4", BODY="#8793a8",
+        GLASS="#cfdced", WHEEL="#c9ced8", TRACK="#dde2ea",
+    ),
+}
+THEME = "dark"
+
+
+def set_theme(name):
+    """Switches the colour palette (call before any window is built)."""
+    global THEME
+    THEME = name if name in PALETTES else "dark"
+    globals().update(PALETTES[THEME])
+
+
+set_theme("dark")
 
 
 def draw_car(c, ox=0, oy=0):
@@ -480,59 +514,184 @@ def draw_car(c, ox=0, oy=0):
 
     c.create_polygon(
         P(8, 66, 8, 50, 40, 44, 70, 40, 96, 16, 172, 16, 204, 40, 244, 46, 256, 58, 252, 66),
-        fill="#4b5263", outline="",
+        fill=BODY, outline="",
     )
-    c.create_polygon(P(80, 38, 100, 20, 170, 20, 194, 38), fill="#9fb4d0", outline="")
-    c.create_line(P(134, 20, 134, 38), fill="#4b5263", width=3)
+    c.create_polygon(P(80, 38, 100, 20, 170, 20, 194, 38), fill=GLASS, outline="")
+    c.create_line(P(134, 20, 134, 38), fill=BODY, width=3)
     c.create_line(P(12, 56, 250, 56), fill=ACCENT, width=2)
     c.create_rectangle(P(8, 48, 14, 54), fill="#d9463e", outline="")
     c.create_rectangle(P(246, 48, 255, 54), fill="#f4f1dd", outline="")
     for cx in (60, 204):
         c.create_oval(P(cx - 18, 50, cx + 18, 86), fill=BG, outline="")
-        c.create_oval(P(cx - 15, 53, cx + 15, 83), fill="#262830", outline=MUTED, width=2)
+        c.create_oval(P(cx - 15, 53, cx + 15, 83), fill=WHEEL, outline=MUTED, width=2)
         c.create_oval(P(cx - 6, 62, cx + 6, 74), fill=MUTED, outline="")
+
+
+class Gauge:
+    """A round gauge drawn on a canvas; the arc changes colour in warning zones."""
+
+    def __init__(self, parent, label, unit, lo, hi, decimals=0, warn=None, danger=None, low_warn=None, low_danger=None):
+        self.lo, self.hi, self.dec = lo, hi, decimals
+        self.warn, self.danger, self.low_warn, self.low_danger = warn, danger, low_warn, low_danger
+        self.shown = "—"
+        self.unit = unit
+        c = self.c = tk.Canvas(parent, width=200, height=190, bg=PANEL, highlightthickness=0)
+        cx, cy, r = 100, 95, 70
+        self.box = (cx - r, cy - r, cx + r, cy + r)
+        c.create_arc(*self.box, start=225, extent=-270, style="arc", width=14, outline=TRACK)
+        for i in range(11):
+            a = math.radians(225 - 27 * i)
+            c.create_line(cx + 80 * math.cos(a), cy - 80 * math.sin(a),
+                          cx + 86 * math.cos(a), cy - 86 * math.sin(a), fill=MUTED)
+        self.arc = c.create_arc(*self.box, start=225, extent=-0.1, style="arc", width=14, outline=ACCENT)
+        self.value = c.create_text(cx, cy - 2, text="—", fill=STRONG, font=("Segoe UI", 24, "bold"))
+        c.create_text(cx, cy + 26, text=unit, fill=MUTED, font=("Segoe UI", 10))
+        c.create_text(cx - 32, cy + 70, text=f"{lo:g}", fill=MUTED, font=("Segoe UI", 8))
+        c.create_text(cx + 32, cy + 70, text=f"{hi:g}", fill=MUTED, font=("Segoe UI", 8))
+        c.create_text(cx, 178, text=label.upper(), fill=MUTED, font=("Segoe UI", 8, "bold"))
+
+    def color(self, v):
+        if (self.danger is not None and v >= self.danger) or (self.low_danger is not None and v <= self.low_danger):
+            return BAD
+        if (self.warn is not None and v >= self.warn) or (self.low_warn is not None and v <= self.low_warn):
+            return WARN
+        return ACCENT
+
+    def set(self, v):
+        if v is None:
+            self.shown = "n/a"
+            self.c.itemconfig(self.value, text="n/a")
+            self.c.itemconfig(self.arc, extent=-0.1, outline=ACCENT)
+            return
+        frac = min(1.0, max(0.0, (v - self.lo) / (self.hi - self.lo)))
+        self.shown = f"{v:.{self.dec}f}"
+        self.c.itemconfig(self.arc, extent=-max(0.1, 270 * frac), outline=self.color(v))
+        self.c.itemconfig(self.value, text=self.shown)
+
+    def reset(self):
+        self.shown = "—"
+        self.c.itemconfig(self.value, text="—")
+        self.c.itemconfig(self.arc, extent=-0.1, outline=ACCENT)
+
+
+class Tip:
+    """A small hover hint for a button."""
+
+    def __init__(self, widget, text):
+        self.w, self.text, self.tw = widget, text, None
+        widget.bind("<Enter>", self.show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def show(self, _e=None):
+        if self.tw:
+            return
+        x = self.w.winfo_rootx() + 10
+        y = self.w.winfo_rooty() + self.w.winfo_height() + 6
+        self.tw = tk.Toplevel(self.w)
+        self.tw.wm_overrideredirect(True)
+        self.tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tw, text=self.text, bg=CARD, fg=FG, relief="solid", borderwidth=1,
+                 padx=8, pady=4, font=("Segoe UI", 9)).pack()
+
+    def hide(self, _e=None):
+        if self.tw:
+            self.tw.destroy()
+            self.tw = None
+
+
+# pid -> (label, unit, lowest, highest, decimals, warning zones) for the round gauges
+GAUGES = {
+    0x0C: ("Engine speed", "rpm", 0, 7000, 0, dict(warn=5500, danger=6500)),
+    0x0D: ("Vehicle speed", "km/h", 0, 240, 0, {}),
+    0x05: ("Coolant temperature", "°C", 40, 130, 0, dict(warn=105, danger=115)),
+    0x42: ("Battery voltage", "V", 10, 16, 1, dict(low_warn=12.0, low_danger=11.5, warn=15.0, danger=15.5)),
+}
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.settings_path = os.path.join(os.path.expanduser("~"), "e60_settings.json")
+        self.settings = self.read_settings()
+        set_theme(self.settings.get("theme", "dark"))
         self.title("BMW E60 diagnostics (read-only)")
-        self.geometry("960x780")
-        self.minsize(900, 580)
+        self.geometry("1080x840")
+        self.minsize(1020, 660)
+        try:
+            self.iconbitmap(resource("e60_icon.ico"))
+        except Exception:
+            pass
+        self.restart = False
         self.k = None
         self.busy = False
         self.cancel = False
+        self.cable_found = False
+        self.ticks = 0
         self.last_faults = []
         self.q = queue.Queue()
         self.db = FaultDB()
         self.logfile = os.path.join(os.path.expanduser("~"), "e60_log.txt")
-        self.settings_path = os.path.join(os.path.expanduser("~"), "e60_settings.json")
-        self.settings = self.read_settings()
         self.style_ui()
 
+        # ---- header: title, status lights, car picture ----
         head = tk.Frame(self, bg=BG)
         head.pack(fill="x")
         left = tk.Frame(head, bg=BG)
-        left.pack(side="left", padx=18, pady=14)
-        tk.Label(left, text="BMW E60", font=("Segoe UI", 24, "bold"), fg=FG, bg=BG).pack(anchor="w")
-        tk.Label(left, text="K-line diagnostics  ·  read-only", font=("Segoe UI", 10), fg=MUTED, bg=BG).pack(anchor="w")
+        left.pack(side="left", padx=22, pady=14)
+        tk.Label(left, text="BMW E60", font=("Segoe UI", 26, "bold"), fg=STRONG, bg=BG).pack(anchor="w")
+        tk.Label(left, text="K-line diagnostics  ·  read-only", font=("Segoe UI", 11), fg=MUTED, bg=BG).pack(anchor="w")
         self.art = tk.Canvas(head, width=290, height=100, bg=BG, highlightthickness=0)
-        self.art.pack(side="right", padx=14)
+        self.art.pack(side="right", padx=16)
         self.show_art()
+        mid = tk.Frame(head, bg=BG)
+        mid.pack(side="left", fill="both", expand=True, padx=26)
+        lights = tk.Frame(mid, bg=BG)
+        lights.pack(anchor="w", pady=(24, 0))
+        self.lights = {}
+        for key, text in (("cable", "Cable"), ("port", "Port"), ("car", "Car")):
+            f = tk.Frame(lights, bg=BG)
+            f.pack(side="left", padx=(0, 22))
+            dot = tk.Canvas(f, width=14, height=14, bg=BG, highlightthickness=0)
+            oval = dot.create_oval(2, 2, 12, 12, fill=MUTED, outline="")
+            dot.pack(side="left")
+            lbl = tk.Label(f, text=text, font=("Segoe UI", 11), fg=FG, bg=BG)
+            lbl.pack(side="left", padx=(7, 0))
+            self.lights[key] = (dot, oval, lbl)
+        self.next_step = tk.Label(mid, text="", anchor="w", justify="left", wraplength=420,
+                                  font=("Segoe UI", 11), fg=MUTED, bg=BG)
+        self.next_step.pack(anchor="w", pady=(10, 0))
 
+        # ---- bottom bar ----
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(side="bottom", fill="x")
         self.status = tk.StringVar(value="Port closed")
-        tk.Label(self, textvariable=self.status, anchor="w", bg=BG, fg=MUTED, padx=14, pady=5).pack(side="bottom", fill="x")
+        tk.Label(bar, textvariable=self.status, anchor="w", bg=BG, fg=MUTED, padx=16, pady=7,
+                 font=("Segoe UI", 10)).pack(side="left")
+        b = ttk.Button(bar, text="Light theme" if THEME == "dark" else "Dark theme", style="Small.TButton", command=self.toggle_theme)
+        b.pack(side="right", padx=(0, 14), pady=4)
+        Tip(b, "Switch between the dark and the light look (the program restarts its window)")
+        b = ttk.Button(bar, text="Look up online", style="Small.TButton", command=self.lookup)
+        b.pack(side="right", padx=6, pady=4)
+        Tip(b, "Search the web for the faults you read last")
+        b = ttk.Button(bar, text="Copy this tab", style="Small.TButton", command=self.copy)
+        b.pack(side="right", padx=6, pady=4)
+        Tip(b, "Copy the text of the tab you are looking at")
 
-        ctl = ttk.Frame(self, padding=(14, 12, 14, 0))
+        # ---- connection ----
+        ctl = ttk.Frame(self, padding=(16, 14, 16, 0))
         ctl.pack(fill="x")
         ttk.Label(ctl, text="PORT", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         self.port = ttk.Combobox(ctl, width=16, state="readonly")
         self.port.grid(row=1, column=0)
-        ttk.Button(ctl, text="↻", width=3, command=self.refresh).grid(row=1, column=1, padx=4)
+        b = ttk.Button(ctl, text="↻", width=3, command=self.refresh)
+        b.grid(row=1, column=1, padx=4)
+        Tip(b, "Look for the cable again")
         self.btn = ttk.Button(ctl, text="Open port", style="Accent.TButton", command=self.toggle)
         self.btn.grid(row=1, column=2, padx=(4, 0))
+        Tip(self.btn, "Connect to the cable. Do this first.")
 
-        sel = ttk.Frame(self, padding=(14, 8, 14, 0))
+        sel = ttk.Frame(self, padding=(16, 10, 16, 0))
         sel.pack(fill="x")
         ttk.Label(sel, text="MODULE", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(sel, text="VARIANT  (pick the one for your engine / car)", style="Muted.TLabel").grid(row=0, column=1, sticky="w", padx=(14, 0))
@@ -552,79 +711,127 @@ class App(tk.Tk):
         self.mod.set(saved_mod if saved_mod in self.mod["values"] else "12  " + ADDR_NAMES[0x12])
         self.fill_variants()
 
-        acts = ttk.Frame(self, padding=(14, 10))
+        # ---- action buttons, in groups ----
+        acts = ttk.Frame(self, padding=(16, 14, 16, 6))
         acts.pack(fill="x")
-        ttk.Button(acts, text="Quick scan", style="Accent.TButton", command=lambda: self.run(self.scan_quick, scan=True)).pack(side="left")
-        ttk.Button(acts, text="Full scan", command=lambda: self.run(self.scan_full, scan=True)).pack(side="left", padx=8)
-        ttk.Button(acts, text="Identify", command=lambda: self.run(self.ident)).pack(side="left")
-        ttk.Button(acts, text="Read faults", style="Accent.TButton", command=lambda: self.run(self.faults)).pack(side="left", padx=8)
-        ttk.Button(acts, text="Live data", style="Accent.TButton", command=lambda: self.run(self.live, scan=True)).pack(side="left")
-        ttk.Button(acts, text="Stop", command=self.stop_scan).pack(side="left", padx=8)
-        ttk.Button(acts, text="Copy this tab", command=self.copy).pack(side="right")
-        ttk.Button(acts, text="Look up online", command=self.lookup).pack(side="right", padx=8)
 
+        def group(col, title, buttons):
+            ttk.Label(acts, text=title, style="Muted.TLabel").grid(row=0, column=col, sticky="w")
+            f = ttk.Frame(acts)
+            f.grid(row=1, column=col, sticky="w", padx=(0, 26))
+            for text, style, cmd, tip in buttons:
+                bt = ttk.Button(f, text=text, style=style, command=cmd)
+                bt.pack(side="left", padx=(0, 8))
+                Tip(bt, tip)
+
+        group(0, "CHECK THE CAR", [
+            ("✓ Health check", "Accent.TButton", lambda: self.run(self.health, scan=True),
+             "Ask the main modules and read every fault memory. Start here."),
+            ("Quick scan", "TButton", lambda: self.run(self.scan_quick, scan=True),
+             "Ask the 14 most likely modules which ones are in the car"),
+            ("Full scan", "TButton", lambda: self.run(self.scan_full, scan=True),
+             "Ask all known modules (takes a couple of minutes)"),
+        ])
+        group(1, "ONE MODULE", [
+            ("Identify", "TButton", lambda: self.run(self.ident),
+             "Read the identification of the module chosen above"),
+            ("Read faults", "Accent.TButton", lambda: self.run(self.faults),
+             "Read the fault memory of the module chosen above"),
+            ("▶ Live data", "Accent.TButton", lambda: self.run(self.live, scan=True),
+             "Show engine values live: speed, temperatures, battery voltage"),
+        ])
+        group(2, "", [("■ Stop", "Danger.TButton", self.stop_scan, "Stop the running scan or live data")])
+
+        # ---- tabs ----
         self.tabs = ttk.Notebook(self)
-        self.tabs.pack(fill="both", expand=True, padx=14, pady=(4, 8))
-        res_frame = ttk.Frame(self.tabs)
-        log_frame = ttk.Frame(self.tabs)
-        live_frame = ttk.Frame(self.tabs, padding=14)
-        self.tabs.add(res_frame, text="  Results  ")
-        self.tabs.add(live_frame, text="  Live data  ")
-        self.tabs.add(log_frame, text="  Technical log  ")
+        self.tabs.pack(fill="both", expand=True, padx=16, pady=(6, 8))
+        self.tab_over = ttk.Frame(self.tabs, padding=16)
+        self.tab_res = ttk.Frame(self.tabs)
+        self.tab_live = ttk.Frame(self.tabs, padding=14)
+        self.tab_log = ttk.Frame(self.tabs)
+        self.tabs.add(self.tab_over, text="  Overview  ")
+        self.tabs.add(self.tab_res, text="  Results  ")
+        self.tabs.add(self.tab_live, text="  Live data  ")
+        self.tabs.add(self.tab_log, text="  Technical log  ")
+
+        # overview: one card per module
+        self.over_title = tk.Label(self.tab_over, text="Car health", anchor="w", font=("Segoe UI", 20, "bold"), fg=STRONG, bg=PANEL)
+        self.over_title.pack(fill="x")
+        self.over_sub = tk.Label(
+            self.tab_over, anchor="w", justify="left", font=("Segoe UI", 11), fg=MUTED, bg=PANEL,
+            text="Press ✓ Health check to ask the car's modules and read every fault memory.\n"
+                 "Each module becomes a card: green means no faults, orange means faults. Click a card for details.",
+        )
+        self.over_sub.pack(fill="x", pady=(2, 0))
+        self.over_grid = tk.Frame(self.tab_over, bg=PANEL)
+        self.over_grid.pack(fill="both", expand=True, pady=(12, 0))
+        for c in range(3):
+            self.over_grid.columnconfigure(c, weight=1, uniform="over")
+
+        # live data: round gauges + value cards
         self.live_info = tk.Label(
-            live_frame, text="Press Live data to read the engine computer. Press Stop to end.",
-            anchor="w", bg=PANEL, fg=MUTED, font=("Segoe UI", 10),
+            self.tab_live, text="Press ▶ Live data to read the engine computer. Press ■ Stop to end.",
+            anchor="w", bg=PANEL, fg=MUTED, font=("Segoe UI", 11),
         )
         self.live_info.pack(fill="x")
-        self.live_grid = tk.Frame(live_frame, bg=PANEL)
-        self.live_grid.pack(fill="both", expand=True, pady=(8, 0))
+        self.gauge_row = tk.Frame(self.tab_live, bg=PANEL)
+        self.gauge_row.pack(fill="x", pady=(8, 4))
+        self.gauges = {}
+        for pid, (label, unit, lo, hi, dec, zones) in GAUGES.items():
+            self.gauges[pid] = Gauge(self.gauge_row, label, unit, lo, hi, dec, **zones)
+        self.live_grid = tk.Frame(self.tab_live, bg=PANEL)
+        self.live_grid.pack(fill="both", expand=True, pady=(4, 0))
         for c in range(3):
             self.live_grid.columnconfigure(c, weight=1, uniform="live")
         self.live_vals = {}
         for pid, (label, unit, _f, _d) in LIVE.items():
-            card = tk.Frame(self.live_grid, bg="#181a20", padx=16, pady=12)
-            tk.Label(card, text=label.upper(), font=("Segoe UI", 8, "bold"), fg=MUTED, bg="#181a20").pack(anchor="w")
+            if pid in GAUGES:
+                continue
+            card = tk.Frame(self.live_grid, bg=CARD, padx=16, pady=10)
+            tk.Label(card, text=label.upper(), font=("Segoe UI", 8, "bold"), fg=MUTED, bg=CARD).pack(anchor="w")
             v = tk.StringVar(value="—")
-            tk.Label(card, textvariable=v, font=("Segoe UI", 26, "bold"), fg="#ffffff", bg="#181a20").pack(anchor="w")
-            tk.Label(card, text=unit, font=("Segoe UI", 9), fg=MUTED, bg="#181a20").pack(anchor="w")
+            tk.Label(card, textvariable=v, font=("Segoe UI", 24, "bold"), fg=STRONG, bg=CARD).pack(anchor="w")
+            tk.Label(card, text=unit, font=("Segoe UI", 9), fg=MUTED, bg=CARD).pack(anchor="w")
             self.live_vals[pid] = (v, card)
         self.live_init(list(LIVE), None)
 
+        # results: readable fault cards
         self.res = tk.Text(
-            res_frame, font=("Segoe UI", 11), state="disabled", bg="#181a20", fg=FG, relief="flat",
+            self.tab_res, font=("Segoe UI", 11), state="disabled", bg=CARD, fg=FG, relief="flat",
             padx=20, pady=14, wrap="word", cursor="arrow", spacing1=2, spacing3=2,
         )
-        rsb = ttk.Scrollbar(res_frame, command=self.res.yview)
+        rsb = ttk.Scrollbar(self.tab_res, command=self.res.yview)
         self.res.config(yscrollcommand=rsb.set)
         rsb.pack(side="right", fill="y")
         self.res.pack(side="left", fill="both", expand=True)
         r = self.res
-        r.tag_config("h1", font=("Segoe UI", 17, "bold"), foreground="#ffffff", spacing1=2, spacing3=2)
+        r.tag_config("h1", font=("Segoe UI", 17, "bold"), foreground=STRONG, spacing1=2, spacing3=2)
         r.tag_config("sub", font=("Segoe UI", 10), foreground=MUTED, spacing3=8)
-        r.tag_config("chip", font=("Consolas", 12, "bold"), foreground="#14151a", background="#ffb454", spacing1=16)
-        r.tag_config("meaning", font=("Segoe UI", 12, "bold"), foreground="#ffffff", spacing1=16)
+        r.tag_config("chip", font=("Consolas", 12, "bold"), foreground="#14151a", background=WARN, spacing1=16)
+        r.tag_config("meaning", font=("Segoe UI", 12, "bold"), foreground=STRONG, spacing1=16)
         r.tag_config("orig", font=("Segoe UI", 10), foreground=MUTED, lmargin1=18, lmargin2=18, spacing3=2)
         r.tag_config("item", font=("Segoe UI", 11), foreground=FG, lmargin1=18, lmargin2=34, spacing3=2)
-        r.tag_config("ok", font=("Segoe UI", 13, "bold"), foreground="#4cd964", spacing1=10)
-        r.tag_config("bad", font=("Segoe UI", 11, "bold"), foreground="#ff6b6b", spacing1=6)
-        r.tag_config("good", font=("Segoe UI", 12, "bold"), foreground="#4cd964")
+        r.tag_config("ok", font=("Segoe UI", 13, "bold"), foreground=GOOD, spacing1=10)
+        r.tag_config("bad", font=("Segoe UI", 11, "bold"), foreground=BAD, spacing1=6)
+        r.tag_config("good", font=("Segoe UI", 12, "bold"), foreground=GOOD)
         r.tag_config("body", font=("Segoe UI", 11), foreground=FG, spacing3=4)
         r.tag_config("hint", font=("Segoe UI", 10), foreground=MUTED, spacing1=14)
 
+        # technical log
         self.text = tk.Text(
-            log_frame, font=("Consolas", 9), state="disabled", bg="#0f1014", fg=FG,
+            self.tab_log, font=("Consolas", 9), state="disabled", bg=LOGBG, fg=FG,
             relief="flat", padx=10, pady=8, wrap="word", insertbackground=FG,
         )
-        sb = ttk.Scrollbar(log_frame, command=self.text.yview)
+        sb = ttk.Scrollbar(self.tab_log, command=self.text.yview)
         self.text.config(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.text.pack(side="left", fill="both", expand=True)
-        self.text.tag_config("tx", foreground="#7f8598")
-        self.text.tag_config("rx", foreground="#8fd19e")
-        self.text.tag_config("head", foreground="#6aa9ff", font=("Consolas", 9, "bold"))
-        self.text.tag_config("good", foreground="#4cd964", font=("Consolas", 9, "bold"))
-        self.text.tag_config("bad", foreground="#ff6b6b")
-        self.text.tag_config("fault", foreground="#ffb454", font=("Consolas", 9, "bold"))
+        self.text.tag_config("tx", foreground=MUTED)
+        self.text.tag_config("rx", foreground=GOOD)
+        self.text.tag_config("head", foreground=HEADBLUE, font=("Consolas", 9, "bold"))
+        self.text.tag_config("good", foreground=GOOD, font=("Consolas", 9, "bold"))
+        self.text.tag_config("bad", foreground=BAD)
+        self.text.tag_config("fault", foreground=WARN, font=("Consolas", 9, "bold"))
 
         self.refresh()
         self.render_welcome()
@@ -632,6 +839,7 @@ class App(tk.Tk):
         if not self.db.con:
             self.log("ERROR: fault database e60_data.db not found - only fault numbers will be shown.")
         self.after(100, self.drain)
+        self.tick()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def style_ui(self):
@@ -642,15 +850,19 @@ class App(tk.Tk):
         st.configure("TFrame", background=PANEL)
         st.configure("TLabel", background=PANEL, foreground=FG)
         st.configure("Muted.TLabel", foreground=MUTED, font=("Segoe UI", 8, "bold"))
-        st.configure("TButton", background="#2f323d", foreground=FG, padding=(14, 7), borderwidth=0, focuscolor=PANEL)
-        st.map("TButton", background=[("active", "#3b3f4d")])
+        st.configure("TButton", background=BTN, foreground=FG, padding=(14, 8), borderwidth=0, focuscolor=PANEL, font=("Segoe UI", 10))
+        st.map("TButton", background=[("active", BTN_HOVER)])
+        st.configure("Small.TButton", background=BTN, foreground=FG, padding=(10, 4), borderwidth=0, focuscolor=BG, font=("Segoe UI", 9))
+        st.map("Small.TButton", background=[("active", BTN_HOVER)])
         st.configure("Accent.TButton", background=ACCENT, foreground="white")
         st.map("Accent.TButton", background=[("active", "#2a7de8")])
-        st.configure("TCombobox", fieldbackground=FIELD, background="#2f323d", foreground=FG, arrowcolor=FG, padding=5)
+        st.configure("Danger.TButton", background="#b4443e", foreground="white")
+        st.map("Danger.TButton", background=[("active", "#cf544d")])
+        st.configure("TCombobox", fieldbackground=FIELD, background=BTN, foreground=FG, arrowcolor=FG, padding=5)
         st.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)])
-        st.configure("Vertical.TScrollbar", background="#2f323d", troughcolor=PANEL, arrowcolor=FG)
+        st.configure("Vertical.TScrollbar", background=BTN, troughcolor=PANEL, arrowcolor=FG)
         st.configure("TNotebook", background=PANEL, borderwidth=0)
-        st.configure("TNotebook.Tab", background="#2f323d", foreground=MUTED, padding=(16, 8), borderwidth=0)
+        st.configure("TNotebook.Tab", background=BTN, foreground=MUTED, padding=(18, 9), borderwidth=0, font=("Segoe UI", 10, "bold"))
         st.map("TNotebook.Tab", background=[("selected", ACCENT)], foreground=[("selected", "white")])
         self.option_add("*TCombobox*Listbox.background", FIELD)
         self.option_add("*TCombobox*Listbox.foreground", FG)
@@ -664,6 +876,63 @@ class App(tk.Tk):
             self.art.create_image(145, 50, image=self.photo)
         except Exception:
             draw_car(self.art, 16, 6)
+
+    # ---- status lights ----
+    def set_light(self, key, color, text):
+        dot, oval, lbl = self.lights[key]
+        dot.itemconfig(oval, fill=color)
+        lbl.config(text=text)
+
+    def tick(self):
+        """Twice a second: refresh the status lights; every 2 seconds look for the cable."""
+        self.ticks += 1
+        if self.ticks % 4 == 1:
+            try:
+                real = [p.device for p in list_ports.comports()]
+            except Exception:
+                real = []
+            self.cable_found = bool(real)
+            values = real + [DEMO]
+            if list(self.port["values"]) != values:
+                self.port["values"] = values
+                if self.port.get() not in values:
+                    self.port.set(values[0])
+        self.update_lights()
+        self.after(500, self.tick)
+
+    def update_lights(self):
+        demo = self.port.get() == DEMO
+        cable_ok = self.cable_found or demo
+        opened = self.k is not None
+        now = time.time()
+        ok = getattr(self.k, "last_ok", None) if opened else None
+        fail = getattr(self.k, "last_fail", None) if opened else None
+        self.set_light("cable", GOOD if cable_ok else BAD, "Cable found" if cable_ok else "No cable found")
+        self.set_light("port", GOOD if opened else MUTED, "Port open" if opened else "Port closed")
+        if not opened:
+            self.set_light("car", MUTED, "Car")
+        elif ok and now - ok < 30:
+            self.set_light("car", GOOD, "Car answering")
+        elif fail:
+            self.set_light("car", BAD, "Car not answering")
+        else:
+            self.set_light("car", WARN, "Car not asked yet")
+        if not cable_ok:
+            step = "Plug the cable into the PC."
+        elif not opened:
+            step = "Choose the port and press Open port."
+        elif ok and now - ok < 30:
+            step = "Connected to the car. Press ✓ Health check, or pick a module and press Read faults."
+        elif fail:
+            step = "The car is not answering. Is the ignition on, and the cable switch on K-line?"
+        else:
+            step = "Port is open. Press ✓ Health check."
+        self.next_step.config(text=step)
+
+    def toggle_theme(self):
+        self.settings["theme"] = "light" if THEME == "dark" else "dark"
+        self.restart = True
+        self.on_close()
 
     # ---- logging (thread safe) ----
     def log(self, s):
@@ -702,7 +971,10 @@ class App(tk.Tk):
                     self.live_set(item[1], item[2])
                 elif item[0] == "live_init":
                     self.live_init(item[1], item[2])
-                    self.tabs.select(1)
+                    self.tabs.select(self.tab_live)
+                elif item[0] == "health":
+                    self.render_health(item[1], item[2], item[3], item[4])
+                    self.tabs.select(self.tab_over)
                 elif item[0] == "live_state":
                     self.live_info.config(text=item[1])
                 elif item[0] == "show":
@@ -728,14 +1000,23 @@ class App(tk.Tk):
                 pass
         self.after(100, self.drain)
 
+    def live_text(self):
+        lines = []
+        for pid, (label, unit, _f, _d) in LIVE.items():
+            val = self.gauges[pid].shown if pid in self.gauges else self.live_vals[pid][0].get()
+            lines.append(f"{label}: {val} {unit}")
+        return "\n".join(lines)
+
     def copy(self):
-        i = self.tabs.index(self.tabs.select())
-        if i == 0:
-            txt = self.res.get("1.0", "end")
-        elif i == 1:
-            txt = "\n".join(f"{LIVE[p][0]}: {v.get()} {LIVE[p][1]}" for p, (v, _) in self.live_vals.items())
-        else:
+        cur = str(self.tabs.select())
+        if cur == str(self.tab_live):
+            txt = self.live_text()
+        elif cur == str(self.tab_log):
             txt = self.text.get("1.0", "end")
+        elif cur == str(self.tab_over):
+            txt = getattr(self, "health_text", "") or self.over_title["text"]
+        else:
+            txt = self.res.get("1.0", "end")
         self.clipboard_clear()
         self.clipboard_append(txt)
 
@@ -998,19 +1279,123 @@ class App(tk.Tk):
             self.log(f"ERROR: could not save report: {e}")
             return None
 
+    # ---- health check ----
+    def report_path(self):
+        folder = os.path.join(os.path.expanduser("~"), "Documents")
+        if not os.path.isdir(folder):
+            folder = os.path.expanduser("~")
+        return os.path.join(folder, "E60_fault_report.txt")
+
+    def health(self, ctx):
+        addrs = QUICK
+        total = len(addrs)
+        self.log("--- Health check ---")
+        results = []
+        self.q.put(("health", [], False, total, 0))
+        for i, a in enumerate(addrs, 1):
+            if self.cancel:
+                self.log("Health check stopped.")
+                self.q.put(("health", list(results), True, total, i - 1))
+                break
+            self.q.put(("status", f"Health check: {a:02X} {self.addr_name(a)} ({i} of {total}) …"))
+            if self.k.start(a):
+                entry = {"addr": a, "name": self.addr_name(a), "state": "answered", "count": 0}
+                r = self.k.request(a, [0x18, 0x00, 0xFF, 0x00])
+                if r and r[0] == 0x58:
+                    body = r[2:]
+                    n = sum(1 for j in range(0, len(body) - 2, 3) if body[j] or body[j + 1])
+                    entry.update(state="faults" if n else "ok", count=n)
+                self.k.stop(a)
+                results.append(entry)
+                self.log(f">>> {a:02X}  {entry['name']}  {entry['state']} ({entry['count']})")
+                self.q.put(("health", list(results), False, total, i))
+            time.sleep(0.3)
+        else:
+            self.q.put(("health", results, True, total, total))
+        try:
+            with open(self.report_path(), "a", encoding="utf-8") as f:
+                f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M')}  Health check ===\n")
+                for e in results:
+                    f.write(f"{e['addr']:02X}  {e['name']}: " + (f"{e['count']} fault(s)" if e["state"] == "faults" else
+                            "no faults" if e["state"] == "ok" else "answered") + "\n")
+                if not results:
+                    f.write("No module answered\n")
+        except Exception as e:
+            self.log(f"ERROR: could not save report: {e}")
+
+    def render_health(self, results, done, total, tried):
+        for w in self.over_grid.winfo_children():
+            w.destroy()
+        answered = len(results)
+        faulty = sum(1 for r in results if r["state"] == "faults")
+        if not done:
+            title, color = f"Checking the car …  {tried} of {total}", STRONG
+            sub = "Modules appear below as they answer."
+        elif not answered:
+            title, color = "No module answered", BAD
+            sub = "Check that the ignition is on, the cable is plugged in at both ends and its switch is on K-line."
+        elif not faulty:
+            title, color = f"✓ All good: {answered} modules answered, no faults", GOOD
+            sub = "Click a card to see more about that module."
+        else:
+            title = f"{faulty} of {answered} modules report faults"
+            color = WARN
+            sub = "Click an orange card to see what the faults mean."
+        self.over_title.config(text=title, fg=color)
+        self.over_sub.config(text=sub)
+        lines = [title]
+        for i, r in enumerate(results):
+            self.health_card(i, r)
+            lines.append(f"{r['addr']:02X}  {r['name']}: " + (f"{r['count']} fault(s)" if r["state"] == "faults"
+                         else "no faults" if r["state"] == "ok" else "answered"))
+        self.health_text = "\n".join(lines)
+
+    def health_card(self, i, r):
+        color = {"ok": GOOD, "faults": WARN}.get(r["state"], MUTED)
+        status = {"ok": "✓  No faults", "faults": f"⚠  {r['count']} fault{'s' if r['count'] != 1 else ''}"}.get(r["state"], "Answered")
+        card = tk.Frame(self.over_grid, bg=CARD, cursor="hand2")
+        bar = tk.Frame(card, bg=color, width=6)
+        bar.pack(side="left", fill="y")
+        body = tk.Frame(card, bg=CARD, padx=14, pady=12)
+        body.pack(side="left", fill="both", expand=True)
+        tk.Label(body, text=r["name"], font=("Segoe UI", 12, "bold"), fg=STRONG, bg=CARD, anchor="w").pack(fill="x")
+        tk.Label(body, text=f"Address {r['addr']:02X}", font=("Segoe UI", 9), fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
+        tk.Label(body, text=status, font=("Segoe UI", 13, "bold"), fg=color, bg=CARD, anchor="w").pack(fill="x", pady=(6, 0))
+        card.grid(row=i // 3, column=i % 3, padx=6, pady=6, sticky="nsew")
+        for w in (card, bar, body, *body.winfo_children()):
+            w.bind("<Button-1>", lambda e, a=r["addr"]: self.open_module(a))
+
+    def open_module(self, addr):
+        """Clicking a card: choose that module and read its faults."""
+        if self.busy:
+            return
+        for v in self.mod["values"]:
+            if v.startswith(f"{addr:02X}  "):
+                self.mod.set(v)
+                self.on_module()
+                break
+        self.run(self.faults)
+
     # ---- live data ----
     def live_init(self, pids, text):
-        for pid, (v, card) in self.live_vals.items():
+        for g in self.gauges.values():
+            g.c.grid_forget()
+            g.reset()
+        for v, card in self.live_vals.values():
             card.grid_forget()
             v.set("—")
-        for i, pid in enumerate(p for p in LIVE if p in pids):
+        for i, pid in enumerate(p for p in GAUGES if p in pids):
+            self.gauges[pid].c.grid(row=0, column=i, padx=6, pady=4)
+        for i, pid in enumerate(p for p in LIVE if p in pids and p not in GAUGES):
             self.live_vals[pid][1].grid(row=i // 3, column=i % 3, padx=6, pady=6, sticky="nsew")
         if text:
             self.live_info.config(text=text)
 
     def live_set(self, pid, value):
-        v = self.live_vals[pid][0]
-        v.set("n/a" if value is None else f"{value:.{LIVE[pid][3]}f}")
+        if pid in self.gauges:
+            self.gauges[pid].set(value)
+        else:
+            self.live_vals[pid][0].set("n/a" if value is None else f"{value:.{LIVE[pid][3]}f}")
 
     def read_pid(self, t, pid, functional):
         r = self.k.request(t, [0x01, pid], timeout=0.8, functional=functional)
@@ -1100,7 +1485,7 @@ class App(tk.Tk):
 
     def render(self, kind, payload):
         getattr(self, "render_" + kind)(payload)
-        self.tabs.select(0)
+        self.tabs.select(self.tab_res)
 
     def render_welcome(self):
         self.res_clear()
@@ -1217,5 +1602,13 @@ class App(tk.Tk):
         self.destroy()
 
 
+def main():
+    while True:
+        app = App()
+        app.mainloop()
+        if not app.restart:
+            break
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    main()
